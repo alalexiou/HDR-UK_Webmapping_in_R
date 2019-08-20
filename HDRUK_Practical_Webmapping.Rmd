@@ -1,0 +1,223 @@
+---
+title: 'HDR-UK Summer School: Introduction to Webmapping in R'
+author: "Alexandros Alexiou"
+date: "12/08/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{css, echo=FALSE, cache=FALSE}
+pre code, pre, code {
+  white-space: pre !important;
+  overflow-x: auto;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+```
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width=800)
+options(scipen = 999)
+```
+
+
+## Interactive Child Obesity Map
+
+Webmaps are particularly useful when we want to publish detailed small-area or point data across wider regions, where zooming in and out is essential in order to explore patterns.
+
+In this practical we will use the library [leaflet](https://rstudio.github.io/leaflet/) to make a simple interactive map. In this scenario we will make a choropleth map, i.e. a thematic map in which small areas, depicted as polygons, are shaded in proportion to the value being displayed on the map.
+
+We can start by loading the necessary libraries:
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(readODS)
+library(sf)
+library(leaflet)
+library(RColorBrewer)
+```
+
+### Get Child Obesity data
+
+For this example we will use the [Child obesity and excess weight: small area level data](https://www.gov.uk/government/statistics/child-obesity-and-excess-weight-small-area-level-data) dataset, published by Public Health England. Unfortunately it comes in open office format (.ods), which can be a little tricky to load into R (and slow). We will explore the dataset relating to the percentage of children characterised as obese at reception.
+
+```{r, echo = FALSE}
+# Dowload child obesity data
+url.data <- "https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/788999/NCMP_data_MSOA_update_2019.ods"
+
+if(file.exists("NCMP_data_MSOA_update_2019.ods") == F) {
+  download.file(url.data, destfile = "NCMP_data_MSOA_update_2019.ods", method = "curl",
+                quiet=FALSE)
+}
+```
+
+```{r, echo = T, warning=FALSE, cache=TRUE}
+# Read data
+obs_msoa <- read_ods("NCMP_data_MSOA_update_2019.ods", sheet = 3, skip = 2)
+
+# We specify periods by the last year
+colnames(obs_msoa)[5:44] <- paste0("Y", rep(2011:2018, each = 5), "_",
+                                   colnames(obs_msoa)[5:44])
+# Sample
+head(obs_msoa, 4)
+
+# In this example we will just keep the percentages
+obs_msoa <- obs_msoa[, c(1, 4, seq(7, 42, by = 5))]
+
+# Some cleaning (Warnings are ok)
+colnames(obs_msoa) <- gsub("%", "PC", colnames(obs_msoa))
+colnames(obs_msoa) <- gsub(" ", "_", colnames(obs_msoa))
+obs_msoa[, 3:10] <- as.data.frame(lapply(obs_msoa[, 3:10], as.numeric))
+
+```
+
+### Get MSOA boundaries
+
+In order to visualize the data into polygons we will the Middle Super Output Area Boundaries. These are part of the Census 2011 Geography. Boundary data can be found in [Census Support Easy Download: English Boundary datasets](https://borders.ukdataservice.ac.uk/easy_download.html) section of the UK Data Service website, although a much detailed repository of spatial datasets and lookup tables can be found at the [ONS Open Geography Portal](https://geoportal.statistics.gov.uk/).
+
+Note that spatial data come in various formats. The most common one is arguably the ESRI Shapefile, which is a collection of files i.e. one for the spatial data (.shp), one for the dataset underneath (.dbf), one for the spatial projection (.prj), etc. However, most online repositories denote them with .SHP and offer them within a single .zip file.
+
+
+```{r, echo = FALSE}
+# Download the MSOA Shapefile (polygon layer)
+url.shp <- "https://borders.ukdataservice.ac.uk/ukborders/easy_download/prebuilt/shape/England_msoa_2011_sgen_clipped.zip"
+
+download.file(url.shp, destfile = "temp.zip", method = "auto" , quiet=FALSE)
+unzip("temp.zip")
+# Delete the original zip file
+unlink("temp.zip")
+
+```
+
+There are a number of libraries that can be used to load vector data (shapefiles) into R. We will use the library `sf` a.k.a [simple features](https://r-spatial.github.io/sf/) here for simplicity and convenience. 
+ 
+
+```{r, echo = T, fig.width=5, fig.height=5}
+# Read data
+msoa_poly <- st_read("england_msoa_2011_sgen_clipped.shp")
+# Fix projection
+msoa_poly <- st_transform(msoa_poly, 4326)
+
+# Make a simple plot of just the features
+# Note that plot(msoa_poly) plots all features with all variables
+plot(st_geometry(msoa_poly))
+
+```
+
+
+### Join obesity data to spatial data 
+
+This step is perhaps the most common in analysing spatial data. We will use the ONS MSOA codes to join the obesity data to the polygon features. It is relatively straightforward:
+
+```{r, echo = T,  fig.width=5, fig.height=5}
+# Merge data
+obs_poly <- merge(msoa_poly, obs_msoa,  by.x = "code", by.y = "MSOA_code", all.x = T)
+
+# Sf has its own merge method
+str(obs_poly)
+
+# Plot the latest values (2015/16 to 2017/18)
+plot(obs_poly["Y2018_PC"], border = NA)
+
+```
+
+### Webmap Basics
+
+Now, we can't see a lot of details in that scale, as there are over 6,000 MSOAs in England. We will try to make an interactive map, or webmap, where we can zoom in/out, get pop-up information by clicking at features, dynamic labels, etc. 
+
+We can create a map “widget’ object using the `leaflet()` function. There is a ton of features / functionality we can add in a webmap, like adding a backdrop (background map) automatically. By default this is an [OpenStreetMap](https://www.openstreetmap.org/#map=5/54.910/-3.432), but there are also other visualisations available. 
+
+An issue to look out for here is _projections_. Projections are kind of complicated and out of the scope of this practical, but you should know that the Leaflet package expects all point, line, and shape data to be specified in latitude and longitude using WGS84 (a.k.a. EPSG:4326).
+
+There is a function to return the projection, within the `sf` package we can call `st_crs`. Our MSOA data have a projection of:
+
+```{r, echo = T}
+st_crs(obs_poly)
+```
+
+Which is fine, but remember to always test!. Note that many UK spatial datasets come with the OSGB 1936 / British National Grid (BNG) projection, or EPSG:27700. A common issue is that you will not get an error about this, it will be just an empty map; your actual i.e. GP data might be somewhere in the Pacific Ocean. 
+
+Now we can make a basic webmap - without any data - as a start:
+
+```{r, echo = T,  fig.width=8, fig.height=5 }
+obs_map <- leaflet(obs_poly) %>% addTiles() 
+obs_map %>% fitBounds(-3.195992, 53.338868, -2.762375, 53.462912) # zoom to Liverpool
+```
+
+There is a variety of graphics that can be passed to the map. For instance, we can pass a tile layer with graphics using `addTiles()` or `addProviderTiles()`. Simply run `addProviderTiles("Stamen.Toner")` to change the backdrop. You can find a complete list of available backdrops by visiting <http://leaflet-extras.github.io/leaflet-providers/preview/>.
+
+### Child Obesity Map
+
+As seen in the example above, adding elements to the map can be done effectively with the the pipe operator `%>%`, which "pipes" objects down multiple functions. Otherwise, you can just add elements to the basic map the conventional way, i.e. by overwriting the original map object (both methods are demonstrated here). 
+
+Now we can visualise the polygon data using the `fillColor` argument, specifying a pre-defined palette, _Yellow-Orange-Red_, and the value to map, in this case _Y2018_PC_. `colorQuantile` maps the value using quantiles, but we can use other methods, such as _jenks_ or custom breaks. We can access more palettes with the `RColorBrewer` library.
+
+
+```{r, echo = T, fig.width=8, fig.height=5}
+obs_map %>% addPolygons(color = "black", 
+                        weight = 1, 
+                        smoothFactor = 0.5,
+                        opacity = 1.0, 
+                        fillOpacity = 0.5, 
+                        fillColor = ~colorQuantile("YlOrRd", Y2018_PC)(Y2018_PC))
+
+```
+
+
+
+This is a basic map but we can make a few adjustments. We can remove the black borders of the areas since they are clogging up our image - we can specify a grey colour with just a lot of tranpsarency with `opacity=0.1`, and add a legend with `addLegend()`. We will not use the pipe this time, we will just add each element to the map object `obs_map`.
+
+```{r, echo = T}
+# Custom breaks
+col_breaks <- c(0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 20.8)
+# Make a palette
+col_pal <- colorBin("YlOrRd", domain = obs_poly$Y2018_PC, bins = col_breaks)
+```
+
+```{r, echo = T, fig.width=8, fig.height=5}
+# Make initial map
+obs_map <- addPolygons(map = obs_map,
+                       color = "grey",
+                       weight = 1, 
+                       smoothFactor = 0.5,
+                       opacity = 0.1, 
+                       fillOpacity = 0.75,
+                       fillColor = ~col_pal(Y2018_PC),
+                       highlightOptions = highlightOptions(color = "white", 
+                                                            opacity = 1,
+                                                            weight = 2,
+                                                            bringToFront = TRUE),
+                       popup = ~paste0("MSOA: ", name, "(", Y2018_PC,"%)"))
+```
+
+```{r, echo = T, fig.width=8, fig.height=5}
+# Now add the legend
+obs_map <- addLegend(obs_map, 
+                      pal = col_pal, 
+                      values = ~Y2018_PC, 
+                      opacity = 0.9, 
+                      title = "Child Obesity at Reception (%)",
+                      labFormat = labelFormat(suffix="%"), 
+                      # labFormat: you can add transform = function(x) x*100 if x={0,1}
+                      na.label = "No Data",
+                      position = "bottomright")
+```
+
+```{r, echo = T, fig.width=8, fig.height=5}
+# Plot the map
+obs_map
+```
+
+Note that we can highlight areas in the map with `highlightOptions` and include a pop-up window giving more information on the area with `popup`. We can also add HTML integration in the map for some increased pop-up functionality (more details [here](https://rstudio.github.io/leaflet/choropleths.html)).There are many more options to explore, the best way to do this is to look at the leaflet [documentation](https://rstudio.github.io/leaflet/). 
+
+It is also worth noting that there is a shiny integration with leaflet. One can add scroll bars, drop-down lists, buttons etc. within the webmap widget. For those feeling adventurous, take a look [here](https://rstudio.github.io/leaflet/shiny.html).
+
+Optional Tasks / Excercises:
+
+* Make a map showing the percentage of change between 2011 and 2018. 
+* Add the Lower and Upper CI in the pop-up.
+* Try to apply a palette that is neutral (white) around the mean value.
+
+If you want to map _points_ you can also check another practical, _Mapping the refugee crisis in Greece using leaflet_, which is available [here](https://rpubs.com/dblalex/182480), and might be of interest. 
